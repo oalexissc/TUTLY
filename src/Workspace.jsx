@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import './Workspace.css';
-import { TUTOR_PROFILES } from './tutorProfiles';
+import { getSupabase } from './supabaseClient';
 
-const STORAGE_KEY = 'tutly-workspace-v1';
 const SUBJECTS = [
   { name: 'Matemáticas', icon: 'x²', color: 'blue' },
   { name: 'Física', icon: 'F', color: 'amber' },
@@ -17,78 +16,39 @@ const COMMON_QUESTIONS = {
 };
 const REASONS = ['No entiendo el enunciado', 'No sé qué fórmula usar', 'Me sale otro resultado', 'Otro'];
 const TIME_OPTIONS = ['Menos de 15 min', '15 a 45 min', 'Más de 45 min'];
+const QUESTION_COLUMNS = 'id, student_id, student_name, grade, subject, title, question, reason, detail, stuck_time, voice_note, created_at, status, answer, answered_by, answered_by_name, answered_at';
+const EMPTY_DATA = { student: null, tutor: null, questions: [], serviceMinutes: 0 };
 
-function createInitialData() {
+function mapQuestion(row) {
   return {
-    student: null,
-    tutor: null,
-    questions: [
-      {
-        id: 'demo-1',
-        studentName: 'Mateo',
-        grade: '1ro BGU',
-        subject: 'Física',
-        title: 'Componentes de un vector de 20 N',
-        question: '¿Cuándo uso seno o coseno en vectores?',
-        reason: 'No sé qué fórmula usar',
-        detail: '',
-        stuckTime: '15 a 45 min',
-        createdAt: new Date().toISOString(),
-        status: 'answered',
-        answer: 'Usa coseno para la componente adyacente al ángulo y seno para la opuesta. Dibuja primero el vector y marca el ángulo respecto al eje.',
-        answeredBy: 'Joel',
-      },
-      {
-        id: 'demo-2',
-        studentName: 'Valentina',
-        grade: '2do BGU',
-        subject: 'Matemáticas',
-        title: 'Sistema de ecuaciones',
-        question: 'Entiendo el procedimiento, pero me sale otro resultado.',
-        reason: 'Me sale otro resultado',
-        detail: 'Estoy usando el método de sustitución.',
-        stuckTime: 'Más de 45 min',
-        createdAt: new Date(Date.now() - 19 * 60 * 1000).toISOString(),
-        status: 'pending',
-      },
-      {
-        id: 'demo-3',
-        studentName: 'Mateo',
-        grade: '1ro BGU',
-        subject: 'Física',
-        title: 'Movimiento rectilíneo',
-        question: 'No entiendo cómo plantear el ejercicio.',
-        reason: 'No entiendo el enunciado',
-        detail: '',
-        stuckTime: '15 a 45 min',
-        createdAt: new Date(Date.now() - 27 * 60 * 1000).toISOString(),
-        status: 'pending',
-      },
-    ],
-    serviceMinutes: 750,
+    id: row.id,
+    studentId: row.student_id,
+    studentName: row.student_name,
+    grade: row.grade,
+    subject: row.subject,
+    title: row.title,
+    question: row.question,
+    reason: row.reason,
+    detail: row.detail,
+    stuckTime: row.stuck_time,
+    voiceNote: row.voice_note,
+    createdAt: row.created_at,
+    status: row.status,
+    answer: row.answer,
+    answeredById: row.answered_by,
+    answeredBy: row.answered_by_name,
   };
 }
 
-function loadData() {
-  let saved;
-  try {
-    saved = localStorage.getItem(STORAGE_KEY);
-  } catch (error) {
-    console.error('No se pudo acceder al almacenamiento de TUTLY.', error);
-    return createInitialData();
-  }
-  if (!saved) return createInitialData();
-
-  try {
-    const parsed = JSON.parse(saved);
-    if (parsed && Array.isArray(parsed.questions) && typeof parsed.serviceMinutes === 'number') {
-      return { ...createInitialData(), ...parsed };
-    }
-    throw new Error('El formato guardado de TUTLY no es válido.');
-  } catch (error) {
-    console.error('No se pudo leer el espacio guardado de TUTLY.', error);
-    return createInitialData();
-  }
+function mapProfile(row) {
+  return {
+    id: row.id,
+    name: row.nombre,
+    school: row.colegio,
+    grade: row.curso,
+    role: row.role,
+    subjects: row.materias,
+  };
 }
 
 function formatTime(dateString) {
@@ -153,6 +113,13 @@ function VoiceRecorder({ onSave }) {
       };
       recorder.onstop = () => {
         const audio = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+        if (audio.size > 1_000_000) {
+          setError('La nota supera el límite de 1 MB. Graba un audio más corto.');
+          mediaStream.getTracks().forEach((track) => track.stop());
+          setStream(null);
+          setRecording(false);
+          return;
+        }
         const reader = new FileReader();
         reader.onload = () => {
           onSave(String(reader.result));
@@ -240,11 +207,11 @@ function Workspace() {
   const location = useLocation();
   const navigate = useNavigate();
   const isTutor = location.pathname === '/tutor';
-  const suggestedTutor = isTutor
-    ? TUTOR_PROFILES.find((tutor) => tutor.id === new URLSearchParams(location.search).get('profile'))
-    : null;
-  const [data, setData] = useState(loadData);
-  const [screen, setScreen] = useState(isTutor && (suggestedTutor || data.tutor) ? 'home' : isTutor ? 'profiles' : 'onboarding');
+  const [data, setData] = useState(EMPTY_DATA);
+  const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [screen, setScreen] = useState(isTutor ? 'home' : 'onboarding');
   const [studentTab, setStudentTab] = useState('home');
   const [tutorTab, setTutorTab] = useState('questions');
   const [selectedSubject, setSelectedSubject] = useState('Matemáticas');
@@ -254,33 +221,155 @@ function Workspace() {
   const [filters, setFilters] = useState({ subject: 'Todas', grade: 'Todos' });
   const [answer, setAnswer] = useState('');
   const [profileForm, setProfileForm] = useState({ school: '', name: '', grade: '' });
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [studentMode, setStudentMode] = useState('signup');
+  const [signupNotice, setSignupNotice] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
   const [persistenceError, setPersistenceError] = useState('');
-
-  const saveData = (nextData) => {
-    setData(nextData);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nextData));
-      setPersistenceError('');
-    } catch (error) {
-      console.error('No se pudo guardar el espacio de TUTLY.', error);
-      setPersistenceError('No se pudieron guardar los cambios en este navegador. Libera espacio y vuelve a intentarlo.');
-    }
-  };
+  const activeProfile = profile?.id === user?.id ? profile : null;
 
   useEffect(() => {
-    const syncData = (event) => {
-      if (event.key === STORAGE_KEY && event.newValue) {
-        const updated = JSON.parse(event.newValue);
-        if (updated && Array.isArray(updated.questions)) setData(updated);
+    let active = true;
+    let subscription;
+
+    const initializeAuth = async () => {
+      await Promise.resolve();
+      if (!active) return;
+
+      try {
+        const supabase = await getSupabase();
+        const { data: authData } = supabase.auth.onAuthStateChange((_event, session) => {
+          if (!active) return;
+          setUser(session?.user || null);
+          setPersistenceError('');
+        });
+        subscription = authData.subscription;
+
+        const { data: sessionData, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        if (active) setUser(sessionData.session?.user || null);
+      } catch (error) {
+        if (!active) return;
+        console.error('No se pudo inicializar la sesión de Supabase.', error);
+        setPersistenceError(error instanceof Error ? error.message : 'No se pudo inicializar la sesión de Supabase.');
+      } finally {
+        if (active) setAuthLoading(false);
       }
     };
-    window.addEventListener('storage', syncData);
-    return () => window.removeEventListener('storage', syncData);
+
+    initializeAuth();
+
+    return () => {
+      active = false;
+      subscription?.unsubscribe();
+    };
   }, []);
 
-  const setProfile = (profile) => saveData({ ...data, [isTutor ? 'tutor' : 'student']: profile });
-  const studentQuestions = data.questions.filter((question) => question.studentName === data.student?.name);
-  const activeTutor = suggestedTutor || data.tutor;
+  useEffect(() => {
+    if (!user) return undefined;
+
+    let active = true;
+
+    const loadProfile = async () => {
+      try {
+        const supabase = await getSupabase();
+        const { data: profileRow, error } = await supabase
+          .from('perfiles')
+          .select('id, nombre, colegio, curso, role, materias')
+          .eq('id', user.id)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (!profileRow) throw new Error('No se encontró tu perfil. Pide al equipo que revise la configuración de Supabase.');
+
+        const nextProfile = mapProfile(profileRow);
+        if (!active) return;
+        setProfile(nextProfile);
+        setPersistenceError('');
+        setData({
+          ...EMPTY_DATA,
+          student: nextProfile.role === 'student' ? nextProfile : null,
+          tutor: nextProfile.role === 'tutor' ? nextProfile : null,
+        });
+      } catch (error) {
+        if (!active) return;
+        console.error('No se pudo cargar el perfil desde Supabase.', error);
+        setPersistenceError(error instanceof Error ? error.message : 'No se pudo cargar tu perfil.');
+      }
+    };
+
+    loadProfile();
+    return () => { active = false; };
+  }, [user]);
+
+  useEffect(() => {
+    const expectedRole = isTutor ? 'tutor' : 'student';
+    if (!user || !activeProfile || activeProfile.role !== expectedRole) return undefined;
+
+    let active = true;
+    let supabase;
+    let channel;
+    const loadQuestions = async () => {
+      const { data: rows, error } = await supabase
+        .from('dudas')
+        .select(QUESTION_COLUMNS)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      if (!active) return;
+
+      const questions = rows.map(mapQuestion);
+      setData((current) => ({
+        ...current,
+        questions,
+        serviceMinutes: questions.filter((question) => question.answeredById === activeProfile.id).length * 8,
+      }));
+      setPersistenceError('');
+    };
+
+    const connectQuestions = async () => {
+      try {
+        supabase = await getSupabase();
+        await loadQuestions();
+        if (!active) return;
+        channel = supabase
+          .channel(`dudas-${activeProfile.id}`)
+          .on('postgres_changes', {
+            event: '*',
+            schema: 'public',
+            table: 'dudas',
+            ...(isTutor ? {} : { filter: `student_id=eq.${activeProfile.id}` }),
+          }, () => {
+            loadQuestions().catch((error) => {
+              if (!active) return;
+              console.error('No se pudieron sincronizar las preguntas.', error);
+              setPersistenceError(error instanceof Error ? error.message : 'No se pudieron sincronizar las preguntas.');
+            });
+          })
+          .subscribe((status) => {
+            if (!active || (status !== 'CHANNEL_ERROR' && status !== 'TIMED_OUT')) return;
+            const error = new Error(`La sincronización en tiempo real no está disponible (${status}).`);
+            console.error('No se pudo iniciar la sincronización de preguntas.', error);
+            setPersistenceError(error.message);
+          });
+      } catch (error) {
+        if (!active) return;
+        console.error('No se pudieron cargar las preguntas desde Supabase.', error);
+        setPersistenceError(error instanceof Error ? error.message : 'No se pudieron cargar las preguntas.');
+      }
+    };
+
+    connectQuestions();
+
+    return () => {
+      active = false;
+      if (supabase && channel) supabase.removeChannel(channel);
+    };
+  }, [activeProfile, isTutor, user]);
+
+  const studentQuestions = data.questions;
+  const activeTutor = activeProfile?.role === 'tutor' ? activeProfile : null;
 
   const beginQuestion = (subject) => {
     setSelectedSubject(subject);
@@ -289,121 +378,235 @@ function Workspace() {
     setScreen('compose');
   };
 
-  const submitQuestion = (event) => {
+  const submitQuestion = async (event) => {
     event.preventDefault();
-    if (!draft.reason) return;
-    const question = {
-      id: `${Date.now()}`,
-      studentName: data.student.name,
-      grade: data.student.grade,
-      subject: draft.subject,
-      title: draft.question.trim().split('\n')[0].slice(0, 76),
-      question: draft.question.trim(),
-      reason: draft.reason,
-      detail: draft.detail.trim(),
-      stuckTime: draft.stuckTime,
-      voiceNote: draft.voiceNote,
-      createdAt: new Date().toISOString(),
-      status: 'pending',
-    };
-    saveData({ ...data, questions: [question, ...data.questions] });
-    setSelectedQuestion(question);
-    setScreen('detail');
-    setStudentTab('questions');
-  };
+    if (!draft.reason || !activeProfile || !user) return;
+    setIsSaving(true);
+    setPersistenceError('');
 
-  const sendAnswer = (event) => {
-    event.preventDefault();
-    if (!answer.trim() || !selectedQuestion) return;
-    saveData({
-      ...data,
-      serviceMinutes: data.serviceMinutes + 8,
-      questions: data.questions.map((question) => question.id === selectedQuestion.id
-        ? { ...question, answer: answer.trim(), answeredBy: activeTutor?.name || 'Tutor', status: 'answered' }
-        : question),
-    });
-    setSelectedQuestion((current) => ({ ...current, answer: answer.trim(), answeredBy: activeTutor?.name || 'Tutor', status: 'answered' }));
-    setAnswer('');
-    setScreen('detail');
-  };
+    try {
+      const supabase = await getSupabase();
+      const { data: row, error } = await supabase
+        .from('dudas')
+        .insert({
+          student_id: user.id,
+          student_name: activeProfile.name,
+          grade: activeProfile.grade,
+          subject: draft.subject,
+          title: draft.question.trim().split('\n')[0].slice(0, 76),
+          question: draft.question.trim(),
+          reason: draft.reason,
+          detail: draft.detail.trim(),
+          stuck_time: draft.stuckTime,
+          voice_note: draft.voiceNote || null,
+        })
+        .select(QUESTION_COLUMNS)
+        .single();
 
-  const logout = () => {
-    setProfile(null);
-    if (isTutor) {
-      navigate('/login');
-      return;
+      if (error) throw error;
+      const question = mapQuestion(row);
+      setData((current) => ({ ...current, questions: [question, ...current.questions] }));
+      setSelectedQuestion(question);
+      setScreen('detail');
+      setStudentTab('questions');
+    } catch (error) {
+      console.error('No se pudo guardar la pregunta en Supabase.', error);
+      setPersistenceError(error instanceof Error ? error.message : 'No se pudo guardar la pregunta.');
+    } finally {
+      setIsSaving(false);
     }
-    setScreen('onboarding');
-    setStudentTab('home');
-    setTutorTab('questions');
   };
 
-  if (!isTutor && !data.student && screen === 'onboarding') {
+  const sendAnswer = async (event) => {
+    event.preventDefault();
+    if (!answer.trim() || !selectedQuestion || !user) return;
+    setIsSaving(true);
+    setPersistenceError('');
+
+    try {
+      const supabase = await getSupabase();
+      const { data: row, error } = await supabase
+        .from('dudas')
+        .update({ answer: answer.trim(), answered_by: user.id, status: 'answered' })
+        .eq('id', selectedQuestion.id)
+        .eq('status', 'pending')
+        .select(QUESTION_COLUMNS)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!row) {
+        setPersistenceError('Esta pregunta ya fue respondida. Actualiza la lista para ver la respuesta.');
+        return;
+      }
+
+      const question = mapQuestion(row);
+      setData((current) => ({
+        ...current,
+        questions: current.questions.map((item) => item.id === question.id ? question : item),
+        serviceMinutes: current.serviceMinutes + 8,
+      }));
+      setSelectedQuestion(question);
+      setAnswer('');
+      setScreen('detail');
+    } catch (error) {
+      console.error('No se pudo guardar la respuesta en Supabase.', error);
+      setPersistenceError(error instanceof Error ? error.message : 'No se pudo guardar la respuesta.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleStudentAccess = async (event) => {
+    event.preventDefault();
+    setIsSaving(true);
+    setPersistenceError('');
+    setSignupNotice('');
+
+    try {
+      const supabase = await getSupabase();
+      if (studentMode === 'login') {
+        const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+        if (error) throw error;
+      } else {
+        const { data: result, error } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: {
+            data: {
+              nombre: profileForm.name.trim(),
+              colegio: profileForm.school,
+              curso: profileForm.grade,
+            },
+          },
+        });
+        if (error) throw error;
+        if (!result.session) setSignupNotice('Revisa tu correo y confirma la cuenta para continuar.');
+      }
+    } catch (error) {
+      console.error('No se pudo autenticar la cuenta de estudiante.', error);
+      setPersistenceError(error instanceof Error ? error.message : 'No se pudo autenticar la cuenta.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const logout = async () => {
+    try {
+      const supabase = await getSupabase();
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      setPersistenceError('');
+      if (isTutor) navigate('/login');
+      else {
+        setScreen('onboarding');
+        setStudentTab('home');
+        setTutorTab('questions');
+      }
+    } catch (error) {
+      console.error('No se pudo cerrar la sesión de Supabase.', error);
+      setPersistenceError(error instanceof Error ? error.message : 'No se pudo cerrar la sesión.');
+    }
+  };
+
+  const profileLoading = Boolean(user && !activeProfile && !persistenceError);
+  if (authLoading || profileLoading) {
+    return <main className="workspace-shell"><p className="intro-copy">Conectando con tu espacio…</p></main>;
+  }
+
+  if (user && !activeProfile) {
     return (
       <main className="workspace-shell">
-        <PageHeader title="" back={() => window.history.back()} action={<Link className="header-link" to="/">Salir</Link>} />
+        <PageHeader title="Tu perfil" action={<button className="header-link button-link" type="button" onClick={logout}>Salir</button>} />
         <section className="onboarding-screen">
-          <div className="welcome-icon">▱</div>
-          <p className="eyebrow">Hola, qué gusto verte</p>
-          <h1>Entra a tu espacio</h1>
-          <p className="intro-copy">Solo necesitamos estos datos para encontrar tu curso. No pedimos tu teléfono.</p>
-          <form className="onboarding-form" onSubmit={(event) => {
-            event.preventDefault();
-            if (profileForm.school && profileForm.name.trim() && profileForm.grade) {
-              setProfile({ ...profileForm, name: profileForm.name.trim() });
-              setScreen('home');
-            }
-          }}>
-            <label>¿En qué colegio estudias?
-              <select required value={profileForm.school} onChange={(event) => setProfileForm({ ...profileForm, school: event.target.value })}>
-                <option value="">Selecciona una opción</option>
-                <option>Unidad Educativa Manuela Cañizares</option>
-                <option>Unidad Educativa Central</option>
-                <option>Otro colegio</option>
-              </select>
-            </label>
-            <label>Tu nombre de pila
-              <input required maxLength={40} placeholder="Ej. Mateo" value={profileForm.name} onChange={(event) => setProfileForm({ ...profileForm, name: event.target.value })} />
-            </label>
-            <label>¿En qué curso estás?
-              <select required value={profileForm.grade} onChange={(event) => setProfileForm({ ...profileForm, grade: event.target.value })}>
-                <option value="">Selecciona una opción</option>
-                {GRADES.map((grade) => <option key={grade}>{grade}</option>)}
-              </select>
-            </label>
-            <button className="primary-button" type="submit">› &nbsp;Entrar</button>
-          </form>
-          <p className="privacy-note"><span>✓</span> Tu tutor solo verá tu nombre, curso y pregunta.</p>
+          <h1>No pudimos cargar tu perfil</h1>
+          <p className="intro-copy">La cuenta se autenticó, pero no encontramos el perfil asociado.</p>
         </section>
         <PersistenceNotice message={persistenceError} />
       </main>
     );
   }
 
-  if (isTutor && !activeTutor && screen === 'profiles') {
+  if (user && activeProfile && activeProfile.role !== (isTutor ? 'tutor' : 'student')) {
     return (
       <main className="workspace-shell">
-        <PageHeader title="Perfiles de tutor" back={() => window.history.back()} action={<Link className="header-link" to="/">Salir</Link>} />
-        <section className="profile-screen">
-          <div className="welcome-icon">♧</div>
-          <p className="eyebrow">Equipo de voluntarios</p>
-          <h1>¿Quién va a ingresar?</h1>
-          <p className="intro-copy">Elige tu perfil para ver preguntas y registrar tus horas de servicio.</p>
-          <div className="tutor-profiles">
-            {TUTOR_PROFILES.map((tutor) => (
-              <button className="tutor-profile-card" key={tutor.id} type="button" onClick={() => {
-                setProfile(tutor);
-                setScreen('home');
-              }}>
-                <span className="avatar">{tutor.initials}</span>
-                <span><strong>{tutor.name}</strong><small>{tutor.subjects}</small></span>
-                <span className="profile-arrow">›</span>
-              </button>
-            ))}
-          </div>
-          <p className="privacy-note"><span>✓</span> Cada tutor registra su propio progreso.</p>
+        <PageHeader title="Acceso" action={<button className="header-link button-link" type="button" onClick={logout}>Salir</button>} />
+        <section className="onboarding-screen">
+          <h1>Este espacio no corresponde a tu cuenta</h1>
+          <p className="intro-copy">Usa el espacio asignado a tu perfil.</p>
+          <Link className="header-link" to={activeProfile.role === 'tutor' ? '/tutor' : '/student'}>Ir a mi espacio</Link>
         </section>
         <PersistenceNotice message={persistenceError} />
+      </main>
+    );
+  }
+
+  if (isTutor && !user) {
+    return (
+      <main className="workspace-shell">
+        <PageHeader title="Espacio de tutor" action={<Link className="header-link" to="/">Salir</Link>} />
+        <section className="onboarding-screen">
+          <div className="welcome-icon">♧</div>
+          <h1>Inicia sesión como tutor</h1>
+          <p className="intro-copy">Necesitas una cuenta de tutor habilitada por el equipo de coordinación.</p>
+          <Link className="header-link" to="/login">Ir a iniciar sesión</Link>
+        </section>
+        <PersistenceNotice message={persistenceError} />
+      </main>
+    );
+  }
+
+  if (!isTutor && !user && screen === 'onboarding') {
+    return (
+      <main className="workspace-shell">
+        <PageHeader title="" back={() => window.history.back()} action={<Link className="header-link" to="/">Salir</Link>} />
+        <section className="onboarding-screen">
+          <div className="welcome-icon">▱</div>
+          <p className="eyebrow">Hola, qué gusto verte</p>
+          <h1>{studentMode === 'signup' ? 'Crea tu cuenta' : 'Entra a tu espacio'}</h1>
+          <p className="intro-copy">Tus preguntas quedarán guardadas en tu cuenta y solo tú y los tutores podrán consultarlas.</p>
+          <form className="onboarding-form" onSubmit={handleStudentAccess}>
+            {studentMode === 'signup' && (
+              <>
+                <label>Tu nombre de pila
+                  <input required maxLength={80} autoComplete="name" placeholder="Ej. Mateo" value={profileForm.name} onChange={(event) => setProfileForm({ ...profileForm, name: event.target.value })} />
+                </label>
+                <label>¿En qué colegio estudias?
+                  <select required value={profileForm.school} onChange={(event) => setProfileForm({ ...profileForm, school: event.target.value })}>
+                    <option value="">Selecciona una opción</option>
+                    <option>Unidad Educativa Manuela Cañizares</option>
+                    <option>Unidad Educativa Central</option>
+                    <option>Otro colegio</option>
+                  </select>
+                </label>
+                <label>¿En qué curso estás?
+                  <select required value={profileForm.grade} onChange={(event) => setProfileForm({ ...profileForm, grade: event.target.value })}>
+                    <option value="">Selecciona una opción</option>
+                    {GRADES.map((grade) => <option key={grade}>{grade}</option>)}
+                  </select>
+                </label>
+              </>
+            )}
+            <label>Correo electrónico
+              <input required type="email" autoComplete="email" placeholder="tu@correo.com" value={email} onChange={(event) => setEmail(event.target.value)} />
+            </label>
+            <label>Contraseña
+              <input required type="password" minLength={8} autoComplete={studentMode === 'signup' ? 'new-password' : 'current-password'} placeholder="Mínimo 8 caracteres" value={password} onChange={(event) => setPassword(event.target.value)} />
+            </label>
+            {persistenceError && <PersistenceNotice message={persistenceError} />}
+            {signupNotice && <p className="privacy-note" role="status">{signupNotice}</p>}
+            <button className="primary-button" type="submit" disabled={isSaving}>
+              {isSaving ? 'Conectando…' : studentMode === 'signup' ? 'Crear cuenta' : 'Iniciar sesión'}
+            </button>
+          </form>
+          <button className="student-auth-toggle" type="button" onClick={() => {
+            setStudentMode(studentMode === 'signup' ? 'login' : 'signup');
+            setPersistenceError('');
+            setSignupNotice('');
+          }}>
+            {studentMode === 'signup' ? '¿Ya tienes cuenta? Inicia sesión' : '¿Aún no tienes cuenta? Regístrate'}
+          </button>
+          <p className="privacy-note"><span>✓</span> Tu tutor solo verá tu nombre, curso y pregunta.</p>
+        </section>
       </main>
     );
   }
@@ -454,7 +657,7 @@ function Workspace() {
             <div className="time-options">
               {TIME_OPTIONS.map((time) => <button key={time} type="button" className={draft.stuckTime === time ? 'time-option active' : 'time-option'} onClick={() => setDraft({ ...draft, stuckTime: time })}>{time}</button>)}
             </div>
-            <button className="primary-button" type="submit" disabled={!draft.reason}>› &nbsp;Enviar pregunta</button>
+            <button className="primary-button" type="submit" disabled={!draft.reason || isSaving}>{isSaving ? 'Enviando…' : '›  Enviar pregunta'}</button>
           </form>
         )}
         <PersistenceNotice message={persistenceError} />
@@ -480,7 +683,7 @@ function Workspace() {
             <form className="answer-form" onSubmit={sendAnswer}>
               <label className="question-label" htmlFor="tutor-answer">Tu explicación</label>
               <textarea id="tutor-answer" rows="5" maxLength={1800} placeholder="Explica los pasos para que el estudiante pueda continuar..." value={answer} onChange={(event) => setAnswer(event.target.value)} />
-              <button className="primary-button" type="submit" disabled={!answer.trim()}>Enviar respuesta</button>
+              <button className="primary-button" type="submit" disabled={!answer.trim() || isSaving}>{isSaving ? 'Enviando…' : 'Enviar respuesta'}</button>
             </form>
           ) : (
             <div className="waiting-panel"><span className="waiting-dot" /> Tu tutor está preparando una explicación.</div>
@@ -497,10 +700,10 @@ function Workspace() {
       const matchesGrade = filters.grade === 'Todos' || question.grade === filters.grade;
       return question.status === 'pending' && matchesSubject && matchesGrade;
     });
-    const answeredCount = data.questions.filter((question) => question.status === 'answered' && question.answeredBy === activeTutor?.name).length;
+    const answeredCount = data.questions.filter((question) => question.status === 'answered' && question.answeredById === activeTutor?.id).length;
     return (
       <main className="workspace-shell tutor-shell">
-        <PageHeader title="Preguntas" back={() => setScreen('profiles')} action={<button className="header-link button-link" type="button" onClick={logout}>Salir</button>} />
+        <PageHeader title="Preguntas" action={<button className="header-link button-link" type="button" onClick={logout}>Salir</button>} />
         <section className="tutor-dashboard">
           <div className="tutor-greeting"><div><p>Hola, {activeTutor?.name}</p><h1>{data.questions.filter((question) => question.status === 'pending').length} estudiantes esperando</h1></div><span className="availability"><i /> Disponible</span></div>
           <div className="service-card"><span className="clock-icon">◷</span><div><strong>{(data.serviceMinutes / 60).toFixed(1).replace('.', ',')} horas de servicio</strong><small>Meta del semestre · 20 horas</small><span className="service-track"><i style={{ width: `${Math.min(100, data.serviceMinutes / 12)}%` }} /></span></div></div>

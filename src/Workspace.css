@@ -243,6 +243,22 @@ button {
   opacity: .55;
 }
 
+.student-auth-toggle {
+  display: block;
+  margin: 16px auto 0;
+  padding: 5px;
+  border: 0;
+  background: transparent;
+  color: #315bf1;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.student-auth-toggle:hover {
+  color: #244de0;
+}
+
 .privacy-note {
   margin: 16px 0 0;
   color: #71819d;

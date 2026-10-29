@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import './Login.css';
-import { TUTOR_PROFILES } from './tutorProfiles';
+import { getSupabase } from './supabaseClient';
 
-const PROFESSOR_EMAIL = 'profesor@tutly.com';
-const PROFESSOR_PASSWORD = 'TUTLY2026';
+const TUTOR_LOGIN_ALIASES = {
+  'profesor@tutly.com': 'alexis1724@hotmail.es',
+};
 
 function Brand() {
   return (
@@ -19,22 +20,150 @@ export default function Login() {
   const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
   const [globalErr, setGlobalErr] = useState('');
-  const [success, setSuccess] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [authMode, setAuthMode] = useState('login');
+  const [name, setName] = useState('');
+  const [signupNotice, setSignupNotice] = useState('');
+  const isRegistering = authMode === 'register';
 
   useEffect(() => {
-    if (!success) return undefined;
-    const timeout = window.setTimeout(() => navigate('/tutor'), 650);
-    return () => window.clearTimeout(timeout);
-  }, [success, navigate]);
+    let active = true;
+    let subscription;
 
-  const handleSubmit = (event) => {
+    const initializeRecovery = async () => {
+      try {
+        const supabase = await getSupabase();
+        if (!active) return;
+
+        const { data } = supabase.auth.onAuthStateChange((event, session) => {
+          if (active && event === 'PASSWORD_RECOVERY' && session) {
+            setAuthMode('reset');
+            setGlobalErr('');
+            setSignupNotice('');
+          }
+        });
+        subscription = data.subscription;
+
+        if (new URLSearchParams(window.location.search).get('mode') === 'reset') {
+          const { data: sessionData, error } = await supabase.auth.getSession();
+          if (error) throw error;
+          if (!active) return;
+          if (sessionData.session) {
+            setAuthMode('reset');
+          } else {
+            setGlobalErr('El enlace de recuperación no es válido o ya venció. Solicita uno nuevo.');
+          }
+        }
+      } catch (error) {
+        if (!active) return;
+        console.error('No se pudo inicializar la recuperación de contraseña.', error);
+        setGlobalErr(error instanceof Error ? error.message : 'No se pudo validar el enlace de recuperación.');
+      }
+    };
+
+    initializeRecovery();
+
+    return () => {
+      active = false;
+      subscription?.unsubscribe();
+    };
+  }, []);
+
+  const handleSubmit = async (event) => {
     event.preventDefault();
     setGlobalErr('');
-    if (email === PROFESSOR_EMAIL && password === PROFESSOR_PASSWORD) {
-      setSuccess(true);
-    } else {
-      setGlobalErr('Credenciales incorrectas');
+    setSignupNotice('');
+    setIsSubmitting(true);
+
+    try {
+      const supabase = await getSupabase();
+      const submittedEmail = email.trim().toLowerCase();
+      const authEmail = TUTOR_LOGIN_ALIASES[submittedEmail] || submittedEmail;
+
+      if (authMode === 'recovery') {
+        const { error } = await supabase.auth.resetPasswordForEmail(authEmail, {
+          redirectTo: `${window.location.origin}/login?mode=reset`,
+        });
+        if (error) throw error;
+        setSignupNotice('Si el correo está registrado, recibirás un enlace para cambiar la contraseña.');
+        return;
+      }
+
+      if (authMode === 'reset') {
+        const { data, error } = await supabase.auth.updateUser({ password: newPassword });
+        if (error) throw error;
+
+        const { data: profile, error: profileError } = await supabase
+          .from('perfiles')
+          .select('role')
+          .eq('id', data.user.id)
+          .maybeSingle();
+
+        if (profileError) {
+          const { error: signOutError } = await supabase.auth.signOut();
+          if (signOutError) console.error('No se pudo cerrar la sesión sin perfil de tutor.', signOutError);
+          throw profileError;
+        }
+
+        if (profile?.role !== 'tutor') {
+          const { error: signOutError } = await supabase.auth.signOut();
+          if (signOutError) console.error('No se pudo cerrar la sesión de una cuenta sin acceso de tutor.', signOutError);
+          setGlobalErr('Esta cuenta no está autorizada como tutor. Usa el correo asignado por coordinación.');
+          return;
+        }
+
+        navigate('/tutor');
+        return;
+      }
+
+      if (isRegistering) {
+        const { data, error } = await supabase.auth.signUp({
+          email: authEmail,
+          password,
+          options: { data: { nombre: name.trim() } },
+        });
+        if (error) throw error;
+
+        if (!data.session) {
+          setSignupNotice('Te enviamos un correo para confirmar la cuenta. Después de confirmarlo, inicia sesión aquí.');
+          return;
+        }
+      }
+
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: authEmail,
+        password,
+      });
+
+      if (error) throw error;
+
+      const { data: profile, error: profileError } = await supabase
+        .from('perfiles')
+        .select('role')
+        .eq('id', data.user.id)
+        .maybeSingle();
+
+      if (profileError) {
+        const { error: signOutError } = await supabase.auth.signOut();
+        if (signOutError) console.error('No se pudo cerrar la sesión sin perfil de tutor.', signOutError);
+        throw profileError;
+      }
+
+      if (profile?.role !== 'tutor') {
+        const { error: signOutError } = await supabase.auth.signOut();
+        if (signOutError) console.error('No se pudo cerrar la sesión de una cuenta sin acceso de tutor.', signOutError);
+        setGlobalErr('Esta cuenta no está autorizada como tutor. Usa el correo asignado por coordinación.');
+        return;
+      }
+
+      navigate('/tutor');
+    } catch (error) {
+      console.error('No se pudo iniciar sesión como tutor.', error);
+      setGlobalErr(error instanceof Error ? error.message : 'No se pudo iniciar sesión. Inténtalo nuevamente.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -44,72 +173,129 @@ export default function Login() {
         <div className="login-main">
           <header className="login-header"><Brand /></header>
           <div className="login-content">
-            {success ? (
-              <div className="login-success" role="status">
-                <span className="success-check">✓</span>
-                <p className="login-eyebrow">Acceso autorizado</p>
-                <h1>¡Qué bueno tenerte aquí!</h1>
-                <p>Estamos preparando tu espacio de tutor.</p>
-              </div>
-            ) : (
-              <>
-                <p className="login-eyebrow">Equipo de tutores</p>
-                <h1>Iniciar sesión</h1>
-                <p className="login-intro">Accede a tu cuenta para responder preguntas y acompañar a tus estudiantes.</p>
+            <p className="login-eyebrow">Equipo de tutores</p>
+            <h1>
+              {authMode === 'recovery'
+                ? 'Recuperar contraseña'
+                : authMode === 'reset'
+                  ? 'Crear nueva contraseña'
+                  : isRegistering
+                    ? 'Crear cuenta de tutor'
+                    : 'Iniciar sesión'}
+            </h1>
+            <p className="login-intro">
+              {authMode === 'recovery'
+                ? 'Te enviaremos un enlace al correo asociado a tu cuenta.'
+                : authMode === 'reset'
+                  ? 'Elige una contraseña nueva para tu cuenta de tutor.'
+                  : isRegistering
+                    ? 'Usa el correo autorizado y confírmalo para activar tu acceso.'
+                    : 'Accede con el correo autorizado de tu cuenta de tutor.'}
+            </p>
 
-                <section className="suggested-profiles" aria-labelledby="suggested-profiles-title">
-                  <div className="suggested-heading">
-                    <h2 id="suggested-profiles-title">Perfiles sugeridos</h2>
-                    <span>Demo</span>
-                  </div>
-                  <div className="suggested-profile-list">
-                    {TUTOR_PROFILES.map((profile) => (
-                      <button
-                        className="suggested-profile"
-                        key={profile.id}
-                        type="button"
-                        onClick={() => navigate(`/tutor?profile=${profile.id}`)}
-                      >
-                        <span className="suggested-avatar">{profile.initials}</span>
-                        <span className="suggested-copy"><strong>{profile.name}</strong><small>{profile.subjects}</small></span>
-                        <span className="suggested-arrow">›</span>
-                      </button>
-                    ))}
-                  </div>
-                </section>
+            <form className="login-form" onSubmit={handleSubmit}>
+              {globalErr && <div className="login-error" role="alert">{globalErr}</div>}
+              {signupNotice && <div className="login-success-notice" role="status">{signupNotice}</div>}
+              {isRegistering && (
+                <label htmlFor="login-name">
+                  Nombre
+                  <input
+                    id="login-name"
+                    type="text"
+                    autoComplete="name"
+                    maxLength={80}
+                    required
+                    placeholder="Profesor"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                  />
+                </label>
+              )}
+              {authMode !== 'reset' && (
+                <label htmlFor="login-email">
+                  Correo electrónico
+                  <input
+                    id="login-email"
+                    type="email"
+                    autoComplete="email"
+                    required
+                    placeholder="tu@correo.com"
+                    value={email}
+                    onChange={(event) => { setEmail(event.target.value); if (globalErr) setGlobalErr(''); }}
+                  />
+                </label>
+              )}
+              {authMode === 'reset' ? (
+                <label htmlFor="new-password">
+                  Nueva contraseña
+                  <input
+                    id="new-password"
+                    type="password"
+                    autoComplete="new-password"
+                    minLength={8}
+                    required
+                    placeholder="Mínimo 8 caracteres"
+                    value={newPassword}
+                    onChange={(event) => { setNewPassword(event.target.value); if (globalErr) setGlobalErr(''); }}
+                  />
+                </label>
+              ) : authMode !== 'recovery' ? (
+                <label htmlFor="login-password">
+                  Contraseña
+                  <input
+                    id="login-password"
+                    type="password"
+                    autoComplete={isRegistering ? 'new-password' : 'current-password'}
+                    minLength={isRegistering ? 8 : undefined}
+                    required
+                    placeholder="••••••••"
+                    value={password}
+                    onChange={(event) => { setPassword(event.target.value); if (globalErr) setGlobalErr(''); }}
+                  />
+                </label>
+              ) : null}
+              <button className="login-submit" type="submit" disabled={isSubmitting}>
+                {isSubmitting
+                  ? 'Procesando…'
+                  : authMode === 'recovery'
+                    ? 'Enviar enlace'
+                    : authMode === 'reset'
+                      ? 'Guardar contraseña'
+                      : isRegistering
+                        ? 'Crear cuenta'
+                        : 'Iniciar sesión'} <span>›</span>
+              </button>
+            </form>
 
-                <div className="login-divider"><span>o inicia sesión con tu cuenta</span></div>
-                <form className="login-form" onSubmit={handleSubmit} noValidate>
-                  {globalErr && <div className="login-error" role="alert">{globalErr}</div>}
-                  <label htmlFor="login-email">
-                    Correo electrónico
-                    <input
-                      id="login-email"
-                      type="email"
-                      autoComplete="email"
-                      placeholder="tu@correo.com"
-                      value={email}
-                      onChange={(event) => { setEmail(event.target.value); if (globalErr) setGlobalErr(''); }}
-                    />
-                  </label>
-                  <label htmlFor="login-password">
-                    Contraseña
-                    <input
-                      id="login-password"
-                      type="password"
-                      autoComplete="current-password"
-                      placeholder="••••••••"
-                      value={password}
-                      onChange={(event) => { setPassword(event.target.value); if (globalErr) setGlobalErr(''); }}
-                    />
-                  </label>
-                  <button className="login-submit" type="submit">Iniciar sesión <span>›</span></button>
-                </form>
-
-                <Link to="/" className="login-back">Volver al inicio</Link>
-                <p className="student-prompt">¿Eres estudiante? <Link to="/student">Entra a tu espacio</Link></p>
-              </>
+            {authMode === 'login' && (
+              <button className="tutor-auth-toggle" type="button" onClick={() => {
+                setAuthMode('recovery');
+                setGlobalErr('');
+                setSignupNotice('');
+              }}>
+                ¿Olvidaste tu contraseña?
+              </button>
             )}
+            {authMode === 'recovery' && (
+              <button className="tutor-auth-toggle" type="button" onClick={() => {
+                setAuthMode('login');
+                setGlobalErr('');
+                setSignupNotice('');
+              }}>
+                Volver a iniciar sesión
+              </button>
+            )}
+            {authMode === 'login' || isRegistering ? (
+              <button className="tutor-auth-toggle" type="button" onClick={() => {
+              setAuthMode((current) => current === 'register' ? 'login' : 'register');
+              setGlobalErr('');
+              setSignupNotice('');
+            }}>
+              {isRegistering ? '¿Ya tienes cuenta? Inicia sesión' : '¿Primera vez? Crear cuenta de tutor'}
+              </button>
+            ) : null}
+            <Link to="/" className="login-back">Volver al inicio</Link>
+            <p className="student-prompt">¿Eres estudiante? <Link to="/student">Entra a tu espacio</Link></p>
           </div>
           <footer className="login-footer">
             <span>© {new Date().getFullYear()} JOBM Tech</span>

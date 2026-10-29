@@ -255,6 +255,11 @@ body {
   background: #244de0;
 }
 
+.login-submit:disabled {
+  cursor: not-allowed;
+  opacity: .6;
+}
+
 .login-submit span {
   font-size: 19px;
   font-weight: 400;
@@ -267,6 +272,27 @@ body {
   background: #fff4f3;
   color: #ac3037;
   font-size: 12px;
+}
+
+.login-success-notice {
+  padding: 11px 12px;
+  border: 1px solid #b9e8d4;
+  border-radius: 9px;
+  background: #f0fff8;
+  color: #176f4c;
+  font-size: 12px;
+}
+
+.tutor-auth-toggle {
+  display: block;
+  margin: 14px auto 0;
+  padding: 5px;
+  border: 0;
+  background: transparent;
+  color: #315bf1;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .login-divider {
